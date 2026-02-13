@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -344,11 +345,37 @@ func summarizeTrivyReport(file, pkgTypes string) (*PatchSummary, error) {
 	return summarizeTrivyFindings(report, pkgTypes), nil
 }
 
+// parsePkgTypesForSummary parses the comma-separated package types string.
+// Returns a slice with defaults to OS if empty or invalid.
+func parsePkgTypesForSummary(pkgTypes string) []string {
+	if pkgTypes == "" {
+		return []string{utils.PkgTypeOS}
+	}
+
+	types := strings.Split(pkgTypes, ",")
+	validTypes := []string{}
+
+	for _, t := range types {
+		t = strings.TrimSpace(t)
+		if t == utils.PkgTypeOS || t == utils.PkgTypeLibrary {
+			validTypes = append(validTypes, t)
+		}
+	}
+
+	if len(validTypes) == 0 {
+		return []string{utils.PkgTypeOS}
+	}
+
+	return validTypes
+}
+
 func summarizeTrivyFindings(report *trivyTypes.Report, pkgTypes string) *PatchSummary {
 	summary := &PatchSummary{}
 
-	includeOS := strings.Contains(pkgTypes, utils.PkgTypeOS) || pkgTypes == ""
-	includeLibrary := strings.Contains(pkgTypes, utils.PkgTypeLibrary)
+	// Parse package types using same logic as patching flow
+	pkgTypesList := parsePkgTypesForSummary(pkgTypes)
+	includeOS := slices.Contains(pkgTypesList, utils.PkgTypeOS)
+	includeLibrary := slices.Contains(pkgTypesList, utils.PkgTypeLibrary)
 
 	for i := range report.Results {
 		r := &report.Results[i]

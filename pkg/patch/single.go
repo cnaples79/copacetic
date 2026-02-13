@@ -47,6 +47,17 @@ func removeIfNotDebug(workingFolder string) {
 	}
 }
 
+// printPatchSummary logs a formatted summary of vulnerability patching results.
+func printPatchSummary(summary *report.PatchSummary) {
+	if summary == nil {
+		return
+	}
+	log.Infof("Patch Summary:")
+	log.Infof("  Total vulnerabilities in report: %d", summary.TotalVulnerabilities)
+	log.Infof("  Patched: %d (%d OS, %d library)", summary.Patched, summary.PatchedOS, summary.PatchedLibrary)
+	log.Infof("  Skipped: %d (no fix available)", summary.SkippedNoFix)
+}
+
 // patchSingleArchImage patches a single architecture image.
 // If sharedProgressCh is non-nil, progress is forwarded to it with platform prefix instead of displaying locally.
 func patchSingleArchImage(
@@ -152,12 +163,7 @@ func patchSingleArchImage(
 			// If after filtering there are zero OS and zero library updates, return an error
 			// only when user explicitly requested some package types (default is OS) but none are patchable.
 			if len(updates.OSUpdates) == 0 && len(updates.LangUpdates) == 0 {
-				if patchSummary != nil {
-					log.Infof("Patch Summary:")
-					log.Infof("  Total vulnerabilities in report: %d", patchSummary.TotalVulnerabilities)
-					log.Infof("  Patched: %d (%d OS, %d library)", patchSummary.Patched, patchSummary.PatchedOS, patchSummary.PatchedLibrary)
-					log.Infof("  Skipped: %d (no fix available)", patchSummary.SkippedNoFix)
-				}
+				printPatchSummary(patchSummary)
 				res, _ := createOriginalImageResult(imageName, &targetPlatform, image)
 				return res, types.ErrNoUpdatesFound
 			}
@@ -260,12 +266,7 @@ func patchSingleArchImage(
 		return nil, err
 	}
 
-	if patchSummary != nil {
-		log.Infof("Patch Summary:")
-		log.Infof("  Total vulnerabilities in report: %d", patchSummary.TotalVulnerabilities)
-		log.Infof("  Patched: %d (%d OS, %d library)", patchSummary.Patched, patchSummary.PatchedOS, patchSummary.PatchedLibrary)
-		log.Infof("  Skipped: %d (no fix available)", patchSummary.SkippedNoFix)
-	}
+	printPatchSummary(patchSummary)
 
 	// Get patched descriptor and add annotations, including preserved states
 	return createPatchResultWithStates(imageName, patchedImageName, &targetPlatform, image, finalLoaderType, patchResult)

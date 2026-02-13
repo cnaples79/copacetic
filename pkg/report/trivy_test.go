@@ -161,6 +161,7 @@ func TestSummarizeTrivyFindings(t *testing.T) {
 		}
 
 		summary := summarizeTrivyFindings(report, utils.PkgTypeOS+","+utils.PkgTypeLibrary)
+		assert.NotNil(t, summary)
 		assert.Equal(t, 4, summary.TotalVulnerabilities)
 		assert.Equal(t, 2, summary.Patched)
 		assert.Equal(t, 1, summary.PatchedOS)
@@ -189,6 +190,7 @@ func TestSummarizeTrivyFindings(t *testing.T) {
 		}
 
 		summary := summarizeTrivyFindings(report, utils.PkgTypeOS)
+		assert.NotNil(t, summary)
 		assert.Equal(t, 1, summary.TotalVulnerabilities)
 		assert.Equal(t, 1, summary.Patched)
 		assert.Equal(t, 1, summary.PatchedOS)
