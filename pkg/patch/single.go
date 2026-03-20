@@ -78,6 +78,7 @@ func patchSingleArchImage(
 	}
 	pkgTypes := opts.PkgTypes
 	libraryPatchLevel := opts.LibraryPatchLevel
+	toolchainPatchLevel := opts.ToolchainPatchLevel
 
 	if reportFile == "" && output != "" {
 		log.Warn("No vulnerability report was provided, so no VEX output will be generated.")
@@ -116,7 +117,13 @@ func patchSingleArchImage(
 
 	// Parse report for update packages
 	var updates *unversioned.UpdateManifest
+	var patchSummary *report.PatchSummary
 	if reportFile != "" {
+		patchSummary, err = report.TrySummarizeScanReport(reportFile, scanner, pkgTypes)
+		if err != nil {
+			return nil, err
+		}
+
 		updates, err = report.TryParseScanReport(reportFile, scanner, pkgTypes, libraryPatchLevel)
 		if err != nil {
 			return nil, err
@@ -146,6 +153,12 @@ func patchSingleArchImage(
 			// If after filtering there are zero OS and zero library updates, return an error
 			// only when user explicitly requested some package types (default is OS) but none are patchable.
 			if len(updates.OSUpdates) == 0 && len(updates.LangUpdates) == 0 {
+				if patchSummary != nil {
+					log.Infof("Patch Summary:")
+					log.Infof("  Total vulnerabilities in report: %d", patchSummary.TotalVulnerabilities)
+					log.Infof("  Patched: %d (%d OS, %d library)", patchSummary.Patched, patchSummary.PatchedOS, patchSummary.PatchedLibrary)
+					log.Infof("  Skipped: %d (no fix available)", patchSummary.SkippedNoFix)
+				}
 				res, _ := createOriginalImageResult(imageName, &targetPlatform, image)
 				return res, types.ErrNoUpdatesFound
 			}
@@ -179,8 +192,12 @@ func patchSingleArchImage(
 		return nil, err
 	}
 
-	// Create channels for build coordination
-	buildChannel := make(chan *client.SolveStatus)
+	// Create channels for build coordination.
+	// Buffer the channel to prevent backpressure from the progress display
+	// blocking BuildKit. The progrock TUI processes events slower than
+	// PlainMode due to rendering overhead; without a buffer, builds that
+	// generate heavy output (e.g. .NET patching) can stall indefinitely.
+	buildChannel := make(chan *client.SolveStatus, 128)
 	eg, ctx := errgroup.WithContext(ctx)
 
 	// Resolve image reference for BuildKit operations
@@ -204,7 +221,7 @@ func patchSingleArchImage(
 	var patchResult *Result
 	eg.Go(func() error {
 		result, err := executePatchBuild(ctx, ch, bkClient, buildConfig, buildkitImageRef, &targetPlatform,
-			workingFolder, updates, ignoreError, reportFile, format, output, patchedImageName, buildChannel, opts.ExitOnEOL)
+			workingFolder, updates, ignoreError, reportFile, format, output, patchedImageName, buildChannel, opts.ExitOnEOL, toolchainPatchLevel)
 		if err != nil {
 			return err
 		}
@@ -246,6 +263,13 @@ func patchSingleArchImage(
 			return res, types.ErrNoUpdatesFound
 		}
 		return nil, err
+	}
+
+	if patchSummary != nil {
+		log.Infof("Patch Summary:")
+		log.Infof("  Total vulnerabilities in report: %d", patchSummary.TotalVulnerabilities)
+		log.Infof("  Patched: %d (%d OS, %d library)", patchSummary.Patched, patchSummary.PatchedOS, patchSummary.PatchedLibrary)
+		log.Infof("  Skipped: %d (no fix available)", patchSummary.SkippedNoFix)
 	}
 
 	// Get patched descriptor and add annotations, including preserved states
@@ -466,6 +490,7 @@ func executePatchBuild(
 	reportFile, format, output, patchedImageName string,
 	buildChannel chan *client.SolveStatus,
 	exitOnEOL bool,
+	toolchainPatchLevel string,
 ) (*Result, error) {
 	var pkgType string
 	var validatedManifest *unversioned.UpdateManifest
@@ -496,15 +521,16 @@ func executePatchBuild(
 		}
 
 		patchOpts := &Options{
-			ImageName:        imageName.String(),
-			TargetPlatform:   targetPlatform,
-			Updates:          updates,
-			ValidatedUpdates: validatedManifest,
-			WorkingFolder:    workingFolder,
-			IgnoreError:      ignoreError,
-			ErrorChannel:     ch,
-			ReturnState:      false, // Always solve for Docker export
-			ExitOnEOL:        exitOnEOL,
+			ImageName:           imageName.String(),
+			TargetPlatform:      targetPlatform,
+			Updates:             updates,
+			ValidatedUpdates:    validatedManifest,
+			WorkingFolder:       workingFolder,
+			IgnoreError:         ignoreError,
+			ErrorChannel:        ch,
+			ReturnState:         false, // Always solve for Docker export
+			ExitOnEOL:           exitOnEOL,
+			ToolchainPatchLevel: toolchainPatchLevel,
 		}
 
 		// Execute the core patching logic

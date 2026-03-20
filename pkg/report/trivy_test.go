@@ -2,6 +2,7 @@ package report
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
@@ -135,6 +136,66 @@ func TestOptimalVersionSelection(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSummarizeTrivyFindings(t *testing.T) {
+	t.Run("counts total patched and skipped for os and library vulnerabilities", func(t *testing.T) {
+		report := &trivyTypes.Report{
+			Results: []trivyTypes.Result{
+				{
+					Class: trivyTypes.ClassOSPkg,
+					Type:  "alpine",
+					Vulnerabilities: []trivyTypes.DetectedVulnerability{
+						{PkgName: "openssl", FixedVersion: "3.0.1-r0"},
+						{PkgName: "musl", FixedVersion: ""},
+					},
+				},
+				{
+					Class: utils.LangPackages,
+					Type:  utils.NodePackages,
+					Vulnerabilities: []trivyTypes.DetectedVulnerability{
+						{PkgName: "ansi-regex", FixedVersion: "6.2.2"},
+						{PkgName: "ws", FixedVersion: ""},
+					},
+				},
+			},
+		}
+
+		summary := summarizeTrivyFindings(report, utils.PkgTypeOS+","+utils.PkgTypeLibrary)
+		assert.Equal(t, 4, summary.TotalVulnerabilities)
+		assert.Equal(t, 2, summary.Patched)
+		assert.Equal(t, 1, summary.PatchedOS)
+		assert.Equal(t, 1, summary.PatchedLibrary)
+		assert.Equal(t, 2, summary.SkippedNoFix)
+	})
+
+	t.Run("respects package type filtering", func(t *testing.T) {
+		report := &trivyTypes.Report{
+			Results: []trivyTypes.Result{
+				{
+					Class: trivyTypes.ClassOSPkg,
+					Type:  "alpine",
+					Vulnerabilities: []trivyTypes.DetectedVulnerability{
+						{PkgName: "busybox", FixedVersion: "1.36.1-r31"},
+					},
+				},
+				{
+					Class: utils.LangPackages,
+					Type:  utils.PythonPackages,
+					Vulnerabilities: []trivyTypes.DetectedVulnerability{
+						{PkgName: "jinja2", FixedVersion: "3.1.6"},
+					},
+				},
+			},
+		}
+
+		summary := summarizeTrivyFindings(report, utils.PkgTypeOS)
+		assert.Equal(t, 1, summary.TotalVulnerabilities)
+		assert.Equal(t, 1, summary.Patched)
+		assert.Equal(t, 1, summary.PatchedOS)
+		assert.Equal(t, 0, summary.PatchedLibrary)
+		assert.Equal(t, 0, summary.SkippedNoFix)
+	})
 }
 
 // TestOptimalVersionSelectionWithPatchLevel tests the library patch level specific logic.
@@ -842,6 +903,118 @@ func TestTrivyParserParseNoHistory(t *testing.T) {
 				assert.Equal(t, "3.3.2-r4", manifest.OSUpdates[0].InstalledVersion)
 				assert.Equal(t, "3.3.2-r5", manifest.OSUpdates[0].FixedVersion)
 			}
+		})
+	}
+}
+
+// TestTrivyParserParseWithPythonVenv tests that Python packages at different paths
+// (e.g. system site-packages vs a venv) are treated as separate upgrade targets via
+// the composite (PkgName + PkgPath) key, and that PkgPath is preserved in UpdatePackage.
+func TestTrivyParserParseWithPythonVenv(t *testing.T) {
+	parser := &TrivyParser{}
+	manifest, err := parser.Parse("testdata/trivy_python_venv.json")
+
+	assert.NoError(t, err)
+	assert.NotNil(t, manifest)
+	assert.Empty(t, manifest.OSUpdates)
+
+	// requests at two different paths → 2 entries; urllib3 at one path → 1 entry = 3 total
+	assert.Equal(t, 3, len(manifest.LangUpdates))
+
+	// Build a lookup by (name, pkgPath) to verify composite-key separation.
+	type key struct{ name, pkgPath string }
+	byKey := make(map[key]struct{})
+	for _, u := range manifest.LangUpdates {
+		byKey[key{u.Name, u.PkgPath}] = struct{}{}
+	}
+
+	_, hasVenvRequests := byKey[key{"requests", "opt/venv/lib/python3.11/site-packages"}]
+	_, hasSysRequests := byKey[key{"requests", "usr/local/lib/python3.11/site-packages"}]
+	_, hasVenvUrllib3 := byKey[key{"urllib3", "opt/venv/lib/python3.11/site-packages"}]
+
+	assert.True(t, hasVenvRequests, "expected requests entry for venv path")
+	assert.True(t, hasSysRequests, "expected requests entry for system path")
+	assert.True(t, hasVenvUrllib3, "expected urllib3 entry for venv path")
+
+	// PkgPath must be preserved in each UpdatePackage.
+	for _, u := range manifest.LangUpdates {
+		assert.NotEmpty(t, u.PkgPath, "PkgPath should be preserved in UpdatePackage")
+		assert.Equal(t, utils.PythonPackages, u.Type)
+		assert.NotEmpty(t, u.FixedVersion)
+	}
+}
+
+// TestTrivyParserParseWithDotNet tests that:
+//   - dotnet-core packages are parsed and use the composite (PkgName + PkgPath) key
+//   - Microsoft.Build.* packages are filtered out
+//   - .NET runtime/platform packages (e.g. Microsoft.AspNetCore.App.Runtime.*) are filtered out
+//   - same package at different paths becomes separate upgrade targets
+func TestTrivyParserParseWithDotNet(t *testing.T) {
+	parser := &TrivyParser{}
+	manifest, err := parser.Parse("testdata/trivy_dotnet.json")
+
+	assert.NoError(t, err)
+	assert.NotNil(t, manifest)
+	assert.Empty(t, manifest.OSUpdates)
+
+	// Expected entries:
+	//   - Microsoft.Identity.Web @ app/MyApp.deps.json  (1 entry)
+	//   - Microsoft.Build.Framework → filtered out
+	//   - Microsoft.AspNetCore.App.Runtime.linux-x64 → filtered out (DotnetPlatform package)
+	//   - Microsoft.NETCore.App.Runtime.linux-x64 → filtered out (DotnetPlatform package)
+	//   - System.Text.Json @ app/MyApp.deps.json        (1 entry)
+	//   - System.Text.Json @ app/OtherLib.deps.json     (1 entry)
+	assert.Equal(t, 3, len(manifest.LangUpdates))
+
+	// Verify Microsoft.Build.* and runtime platform packages are absent.
+	for _, u := range manifest.LangUpdates {
+		assert.False(t, strings.HasPrefix(u.Name, "Microsoft.Build."),
+			"Microsoft.Build.* packages should be filtered out")
+		assert.False(t, isUnpatchableDotnetRuntimePackage(u.Name),
+			".NET runtime/platform packages should be filtered out, but found: %s", u.Name)
+		assert.Equal(t, utils.DotNetPackages, u.Type)
+		assert.NotEmpty(t, u.PkgPath)
+		assert.NotEmpty(t, u.FixedVersion)
+	}
+
+	// Verify System.Text.Json produces two separate entries (different PkgPath).
+	var jsonEntries []string
+	for _, u := range manifest.LangUpdates {
+		if u.Name == "System.Text.Json" {
+			jsonEntries = append(jsonEntries, u.PkgPath)
+		}
+	}
+	assert.ElementsMatch(t, []string{
+		"app/MyApp.deps.json",
+		"app/OtherLib.deps.json",
+	}, jsonEntries, "same package at different paths should be separate upgrade targets")
+}
+
+func TestIsUnpatchableDotnetRuntimePackage(t *testing.T) {
+	tests := []struct {
+		name     string
+		expected bool
+	}{
+		{"Microsoft.AspNetCore.App.Runtime.linux-x64", true},
+		{"Microsoft.AspNetCore.App.Runtime.linux-arm64", true},
+		{"Microsoft.AspNetCore.App.Runtime.win-x64", true},
+		{"Microsoft.NETCore.App.Runtime.linux-x64", true},
+		{"Microsoft.NETCore.App.Runtime.linux-arm64", true},
+		{"Microsoft.WindowsDesktop.App.Runtime.win-x64", true},
+		{"Microsoft.AspNetCore.App.Ref", true},
+		{"Microsoft.NETCore.App.Ref", true},
+		{"Microsoft.NETCore.App.Host.linux-x64", true},
+		// These should NOT be filtered
+		{"Newtonsoft.Json", false},
+		{"System.Text.Json", false},
+		{"Microsoft.Identity.Web", false},
+		{"Microsoft.Extensions.Logging", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isUnpatchableDotnetRuntimePackage(tt.name)
+			assert.Equal(t, tt.expected, result, "isUnpatchableDotnetRuntimePackage(%q)", tt.name)
 		})
 	}
 }
